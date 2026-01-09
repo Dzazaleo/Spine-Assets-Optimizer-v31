@@ -695,22 +695,6 @@ export function analyzeSpineData(
   // 1. Collect from Animations (isSetupPose=false). This establishes the "Active" max scale.
   // 2. Collect from Setup Pose (isSetupPose=true). This participates in Max logic (can override Anim if larger).
   
-  // NEW: Identify Animated Components (Slots and Bones with any timelines)
-  // This allows us to exclude Setup Pose from max-size calculations if the asset is dynamic.
-  const touchedSlots = new Set<string>();
-  const touchedBones = new Set<string>();
-
-  if (json.animations) {
-    Object.values(json.animations).forEach(anim => {
-        if (anim.slots) {
-            Object.keys(anim.slots).forEach(s => touchedSlots.add(s));
-        }
-        if (anim.bones) {
-            Object.keys(anim.bones).forEach(b => touchedBones.add(b));
-        }
-    });
-  }
-  
   const globalStatsMap = new Map<string, GlobalAssetStat>();
 
   const updateGlobalStats = (img: FoundImageResult, animName: string) => {
@@ -719,7 +703,7 @@ export function analyzeSpineData(
       const area = img.maxRenderWidth * img.maxRenderHeight;
       const current = globalStatsMap.get(img.lookupKey);
       
-      // If current does not exist, we MUST add it (either from animation pass, or subsequently from setup pass if not found in animation).
+      // 1. Immediate Entry (New)
       if (!current) {
          globalStatsMap.set(img.lookupKey, {
           path: img.path,
@@ -742,8 +726,14 @@ export function analyzeSpineData(
         return;
       }
 
-      // If current exists, it might be from an animation or setup.
-      // Comparison logic is robust: strictly greater area wins.
+      // 2. Strict Source Priority
+      // If incoming is Setup Pose, but we already have an Animation source, reject Setup.
+      // (Setup Pose should never reduce OR increase dimensions defined by actual animation usage)
+      if (animName === "Setup Pose (Default)" && current.sourceAnimation !== "Setup Pose (Default)") {
+          return;
+      }
+
+      // 3. Area Comparison
       const currentArea = current.maxRenderWidth * current.maxRenderHeight;
       
       if (area > currentArea) {
@@ -766,8 +756,11 @@ export function analyzeSpineData(
           overridePercentage: img.overridePercentage
         });
       } else if (area === currentArea) {
-         if (img.skinName === 'default' && current.skinName !== 'default') {
-            current.skinName = 'default';
+         // Tie-breaker: Prefer non-default skin for documentation clarity
+         if (img.skinName && img.skinName !== 'default') {
+             if (!current.skinName || current.skinName === 'default') {
+                 current.skinName = img.skinName;
+             }
          }
       }
   };
@@ -780,22 +773,11 @@ export function analyzeSpineData(
   });
 
   // PASS 2: Process Setup Pose (Participates in Max Logic)
+  // We now rely on updateGlobalStats to correctly handle priority (Setup < Animation)
+  // and inclusion (New items added).
   results.filter(r => r.isSetupPose).forEach(anim => {
       anim.foundImages.forEach(img => {
-          // EXCLUSION RULE: Only allow Setup Pose to dictate max size if the asset is completely static.
-          // If the slot or any controlling bone has keyframes in ANY animation, we rely solely on 
-          // the animation-derived maximums (Pass 1).
-          const isSlotAnimated = touchedSlots.has(img.slotName);
-          // bonePath format: "bone1/bone2/bone3"
-          const isBoneAnimated = img.bonePath.split('/').some(b => touchedBones.has(b));
-          
-          const alreadyExists = globalStatsMap.has(img.lookupKey);
-
-          // If asset was NOT found in any animation (alreadyExists=false), we must include it from setup pose regardless of animation state.
-          // If asset WAS found (alreadyExists=true), we only update if it is NOT animated (static).
-          if (!alreadyExists || (!isSlotAnimated && !isBoneAnimated)) {
-             updateGlobalStats(img, anim.animationName);
-          }
+          updateGlobalStats(img, anim.animationName);
       });
   });
 
