@@ -1,4 +1,3 @@
-
 import { SpineJson, ProcessedSkinMap, AnalysisResult, FoundImageResult, MissingImageResult, AssetUsage, AnalysisReport, GlobalAssetStat, AttachmentInfo, SpineSkin, SpineAttachmentData, UnusedAsset, AtlasAssetMap } from '../types';
 
 /**
@@ -354,6 +353,31 @@ function calculateBoneScalesForAnimation(
   return boneScales;
 }
 
+function findImage(
+  availableFiles: Map<string, any>, 
+  path: string
+): { key: string; width: number; height: number; sourceWidth?: number; sourceHeight?: number; [key: string]: any } | undefined {
+  const normalizedPath = path.trim().replace(/\\/g, '/').toLowerCase();
+  
+  if (availableFiles.has(normalizedPath)) {
+      const data = availableFiles.get(normalizedPath);
+      return { key: normalizedPath, ...data };
+  }
+
+  if (normalizedPath.indexOf('.') === -1) {
+      const extensions = ['.png', '.jpg', '.jpeg', '.webp'];
+      for (const ext of extensions) {
+          const testKey = normalizedPath + ext;
+          if (availableFiles.has(testKey)) {
+              const data = availableFiles.get(testKey);
+              return { key: testKey, ...data };
+          }
+      }
+  }
+
+  return undefined;
+}
+
 export function analyzeSpineData(
   json: SpineJson, 
   availableFiles: Map<string, { width: number, height: number, sourceWidth?: number, sourceHeight?: number } & Record<string, any>>,
@@ -695,9 +719,32 @@ export function analyzeSpineData(
       const area = img.maxRenderWidth * img.maxRenderHeight;
       const current = globalStatsMap.get(img.lookupKey);
       
+      // If current does not exist, we MUST add it (either from animation pass, or subsequently from setup pass if not found in animation).
+      if (!current) {
+         globalStatsMap.set(img.lookupKey, {
+          path: img.path,
+          lookupKey: img.lookupKey,
+          originalWidth: img.originalWidth,
+          originalHeight: img.originalHeight,
+          physicalWidth: img.physicalWidth,
+          physicalHeight: img.physicalHeight,
+          maxRenderWidth: img.maxRenderWidth,
+          maxRenderHeight: img.maxRenderHeight,
+          maxScaleX: img.maxScaleX!,
+          maxScaleY: img.maxScaleY!,
+          sourceAnimation: animName,
+          sourceSkeleton: skeletonName,
+          frameIndex: img.maxFrameIndex,
+          isOverridden: !!img.isOverridden,
+          skinName: img.skinName,
+          overridePercentage: img.overridePercentage
+        });
+        return;
+      }
+
       // If current exists, it might be from an animation or setup.
       // Comparison logic is robust: strictly greater area wins.
-      const currentArea = current ? current.maxRenderWidth * current.maxRenderHeight : -1;
+      const currentArea = current.maxRenderWidth * current.maxRenderHeight;
       
       if (area > currentArea) {
         globalStatsMap.set(img.lookupKey, {
@@ -719,7 +766,7 @@ export function analyzeSpineData(
           overridePercentage: img.overridePercentage
         });
       } else if (area === currentArea) {
-         if (img.skinName === 'default' && current && current.skinName !== 'default') {
+         if (img.skinName === 'default' && current.skinName !== 'default') {
             current.skinName = 'default';
          }
       }
@@ -742,7 +789,11 @@ export function analyzeSpineData(
           // bonePath format: "bone1/bone2/bone3"
           const isBoneAnimated = img.bonePath.split('/').some(b => touchedBones.has(b));
           
-          if (!isSlotAnimated && !isBoneAnimated) {
+          const alreadyExists = globalStatsMap.has(img.lookupKey);
+
+          // If asset was NOT found in any animation (alreadyExists=false), we must include it from setup pose regardless of animation state.
+          // If asset WAS found (alreadyExists=true), we only update if it is NOT animated (static).
+          if (!alreadyExists || (!isSlotAnimated && !isBoneAnimated)) {
              updateGlobalStats(img, anim.animationName);
           }
       });
@@ -791,170 +842,81 @@ export function analyzeSpineData(
   };
 }
 
-/**
- * Merges multiple analysis reports into a single unified report.
- * Calculates global maximums across all skeletons for shared assets,
- * strictly prioritizing animation-derived stats over setup-pose stats.
- */
 export function mergeAnalysisReports(
-    reports: AnalysisReport[], 
-    availableFiles: Map<string, { width: number, height: number, sourceWidth?: number, sourceHeight?: number } & Record<string, any>>,
-    implicitFiles?: Set<string>
+  reports: AnalysisReport[],
+  availableFiles: Map<string, { width: number, height: number, sourceWidth?: number, sourceHeight?: number } & Record<string, any>>,
+  atlasPageNames: Set<string>
 ): AnalysisReport {
-    if (reports.length === 0) return {
-        animations: [],
-        globalStats: [],
-        unusedAssets: [],
-        skins: [],
-        events: [],
-        controlBones: [],
-        isCanonicalDataMissing: false
-    };
+  if (reports.length === 0) {
+      return {
+          animations: [],
+          globalStats: [],
+          unusedAssets: [],
+          skins: [],
+          events: [],
+          controlBones: [],
+          isCanonicalDataMissing: false
+      };
+  }
 
-    // 1. Merge Animations
-    const mergedAnimations: AnalysisResult[] = [];
-    reports.forEach(r => mergedAnimations.push(...r.animations));
+  const mergedAnimations: AnalysisResult[] = [];
+  const mergedGlobalStats = new Map<string, GlobalAssetStat>();
+  const mergedSkins = new Set<string>();
+  const mergedEvents = new Set<string>();
+  const mergedControlBones = new Set<string>();
+  let isCanonicalDataMissing = false;
 
-    // 2. Merge Global Stats (Max Logic with Animation Priority)
-    // We group all stats by lookupKey to compare sources across reports.
-    const groupedStats = new Map<string, GlobalAssetStat[]>();
-    reports.forEach(r => {
-        r.globalStats.forEach(stat => {
-            if (!groupedStats.has(stat.lookupKey)) {
-                groupedStats.set(stat.lookupKey, []);
-            }
-            groupedStats.get(stat.lookupKey)!.push(stat);
-        });
-    });
+  for (const report of reports) {
+      mergedAnimations.push(...report.animations);
+      
+      report.globalStats.forEach(stat => {
+          const key = stat.lookupKey;
+          const existing = mergedGlobalStats.get(key);
+          if (!existing) {
+              mergedGlobalStats.set(key, stat);
+          } else {
+              const existingArea = existing.maxRenderWidth * existing.maxRenderHeight;
+              const newArea = stat.maxRenderWidth * stat.maxRenderHeight;
+              
+              if (newArea > existingArea) {
+                  mergedGlobalStats.set(key, stat);
+              }
+          }
+      });
 
-    const finalGlobalStats: GlobalAssetStat[] = [];
-    
-    groupedStats.forEach((statsList) => {
-        // Consider ALL candidates (Setup and Animation)
-        const candidates = statsList;
-        
-        // Find the max among the candidates
-        let maxStat = candidates[0];
-        let maxArea = maxStat.maxRenderWidth * maxStat.maxRenderHeight;
-        
-        for (let i = 1; i < candidates.length; i++) {
-            const current = candidates[i];
-            const area = current.maxRenderWidth * current.maxRenderHeight;
-            
-            if (area > maxArea) {
-                maxStat = current;
-                maxArea = area;
-            } else if (area === maxArea) {
-                // Priority: Animation > Setup Pose
-                const isCurrentSetup = current.sourceAnimation === "Setup Pose (Default)";
-                const isMaxSetup = maxStat.sourceAnimation === "Setup Pose (Default)";
-                
-                if (isMaxSetup && !isCurrentSetup) {
-                    // Current is Animation, Max is Setup. Switch to Animation.
-                    maxStat = current;
-                } else if (!isMaxSetup && isCurrentSetup) {
-                    // Max is Animation, Current is Setup. Keep Animation.
-                    // Do nothing regarding source type.
-                } else {
-                    // Tie-breaker: Prefer max scale
-                    const maxScale = Math.max(maxStat.maxScaleX, maxStat.maxScaleY);
-                    const currScale = Math.max(current.maxScaleX, current.maxScaleY);
-                    if (currScale > maxScale) {
-                        maxStat = current;
-                    }
-                }
-            }
-        }
-        finalGlobalStats.push(maxStat);
-    });
+      report.skins.forEach(s => mergedSkins.add(s));
+      report.events.forEach(e => mergedEvents.add(e));
+      report.controlBones.forEach(b => mergedControlBones.add(b));
+      if (report.isCanonicalDataMissing) isCanonicalDataMissing = true;
+  }
 
-    // 3. Recalculate Unused Assets (Global Scope)
-    // An asset is used if it appears in ANY report's global stats (or found images)
-    const usedKeys = new Set<string>();
-    reports.forEach(r => {
-        r.animations.forEach(anim => {
-            anim.foundImages.forEach(img => usedKeys.add(img.lookupKey));
-        });
-    });
-
-    // Handle Implicit Files (e.g. Atlas Pages)
-    if (implicitFiles) {
-        implicitFiles.forEach(fileName => {
-             const match = findImage(availableFiles, fileName);
-             if (match) {
-                 usedKeys.add(match.key);
-             }
-        });
-    }
-
-    const unusedAssets: UnusedAsset[] = [];
-    availableFiles.forEach((metadata, key) => {
-        if (!usedKeys.has(key)) {
-            const fileObj = metadata.file as File | undefined;
-            unusedAssets.push({
-                path: metadata.originalPath || key,
-                fileName: fileObj?.name || key,
-                width: metadata.width,
-                height: metadata.height,
-                size: fileObj?.size || 0
-            });
-        }
-    });
-    unusedAssets.sort((a, b) => b.size - a.size);
-
-    // 4. Merge Sets
-    const skins = new Set<string>();
-    const events = new Set<string>();
-    const controlBones = new Set<string>();
-    let isCanonicalDataMissing = false;
-
-    reports.forEach(r => {
-        r.skins.forEach(s => skins.add(s));
-        r.events.forEach(e => events.add(e));
-        r.controlBones.forEach(b => controlBones.add(b));
-        if (r.isCanonicalDataMissing) isCanonicalDataMissing = true;
-    });
-
-    return {
-        animations: mergedAnimations,
-        globalStats: finalGlobalStats,
-        unusedAssets,
-        skins: Array.from(skins).sort(),
-        events: Array.from(events).sort(),
-        controlBones: Array.from(controlBones).sort(),
-        isCanonicalDataMissing
-    };
-}
-
-function findImage(filesMap: Map<string, { width: number, height: number, sourceWidth?: number, sourceHeight?: number }>, requiredRef: string): { width: number, height: number, sourceWidth?: number, sourceHeight?: number, key: string } | null {
-  const normalizedRef = requiredRef.toLowerCase().replace(/\\/g, '/');
+  const usedKeys = new Set(mergedGlobalStats.keys());
   
-  // Optimization: Direct lookup first
-  if (filesMap.has(normalizedRef)) {
-      const metadata = filesMap.get(normalizedRef)!;
-      return { ...metadata, key: normalizedRef };
-  }
+  const unusedAssets: UnusedAsset[] = [];
+  availableFiles.forEach((val, key) => {
+      if (usedKeys.has(key)) return;
+      
+      const fileName = val.originalPath.split('/').pop() || val.originalPath;
+      if (atlasPageNames.has(val.originalPath) || atlasPageNames.has(fileName)) return;
 
-  // Fallback: Check extensions if strict lookup failed
-  // This is relevant if the JSON omits extensions but the file map has them, 
-  // though for Atlas workflows we normalized keys in App.tsx to usually omit them or match exactly.
-  const extensions = ['.png', '.jpg', '.jpeg', '.webp'];
+      unusedAssets.push({
+          path: val.originalPath,
+          fileName: val.file.name,
+          width: val.width,
+          height: val.height,
+          size: val.file.size
+      });
+  });
+  
+  unusedAssets.sort((a, b) => b.size - a.size);
 
-  for (const ext of extensions) {
-      const target = normalizedRef + ext;
-      if (filesMap.has(target)) {
-          const metadata = filesMap.get(target)!;
-          return { ...metadata, key: target };
-      }
-  }
-
-  // Legacy/Full Scan Fallback: Check for path suffix matches (e.g. folder structure mismatch)
-  // This is expensive but necessary for some loose file structures.
-  for (const [filePath, metadata] of filesMap.entries()) {
-    for (const ext of ['', ...extensions]) {
-      const target = normalizedRef + ext;
-      if (filePath.endsWith('/' + target)) return { ...metadata, key: filePath };
-    }
-  }
-  return null;
+  return {
+      animations: mergedAnimations,
+      globalStats: Array.from(mergedGlobalStats.values()),
+      unusedAssets,
+      skins: Array.from(mergedSkins).sort(),
+      events: Array.from(mergedEvents).sort(),
+      controlBones: Array.from(mergedControlBones).sort(),
+      isCanonicalDataMissing
+  };
 }

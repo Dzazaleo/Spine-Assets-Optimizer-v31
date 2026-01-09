@@ -329,6 +329,17 @@ export default function App() {
       setAtlasPageNames(currentAtlasPageNames);
       setReport(mergedReport);
       
+      // Verification Logging
+      if (mergedReport) {
+        const statsCount = mergedReport.globalStats.length;
+        const animUniqueCount = new Set(mergedReport.animations.flatMap(a => a.foundImages.map(i => i.lookupKey))).size;
+        console.log(`[Optimizer Analysis] Global Stats Items: ${statsCount}`);
+        console.log(`[Optimizer Analysis] Total References in Animations: ${animUniqueCount}`);
+        if (statsCount > animUniqueCount) {
+             console.log(`[Optimizer Analysis] ${statsCount - animUniqueCount} assets identified purely from Setup Pose.`);
+        }
+      }
+
       setAnalysisProgress({ current: 100, total: 100 });
       
     } catch (error) {
