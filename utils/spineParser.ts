@@ -1,3 +1,4 @@
+
 import { SpineJson, ProcessedSkinMap, AnalysisResult, FoundImageResult, MissingImageResult, AssetUsage, AnalysisReport, GlobalAssetStat, AttachmentInfo, SpineSkin, SpineAttachmentData, UnusedAsset, AtlasAssetMap } from '../types';
 
 /**
@@ -359,13 +360,17 @@ function findImage(
 ): { key: string; width: number; height: number; sourceWidth?: number; sourceHeight?: number; [key: string]: any } | undefined {
   const normalizedPath = path.trim().replace(/\\/g, '/').toLowerCase();
   
+  // 1. Strict Match (Exact)
   if (availableFiles.has(normalizedPath)) {
       const data = availableFiles.get(normalizedPath);
       return { key: normalizedPath, ...data };
   }
 
-  if (normalizedPath.indexOf('.') === -1) {
-      const extensions = ['.png', '.jpg', '.jpeg', '.webp'];
+  const extensions = ['.png', '.jpg', '.jpeg', '.webp'];
+  const hasExtension = normalizedPath.indexOf('.') !== -1;
+
+  // 2. Strict Match (Extension Appended)
+  if (!hasExtension) {
       for (const ext of extensions) {
           const testKey = normalizedPath + ext;
           if (availableFiles.has(testKey)) {
@@ -373,6 +378,44 @@ function findImage(
               return { key: testKey, ...data };
           }
       }
+  }
+
+  // 3. Suffix / Fuzzy Directory Match
+  // Search for files that end with the requested path (prefixed with a slash to avoid partial string matches)
+  // e.g. Input: "sword" -> Matches: "images/sword.png" (ends with /sword.png)
+  
+  const searchSuffixes: string[] = [];
+  
+  // Case A: Input has extension or we check exact path suffix
+  searchSuffixes.push('/' + normalizedPath); 
+
+  // Case B: Input has no extension, check extensions
+  if (!hasExtension) {
+      for (const ext of extensions) {
+          searchSuffixes.push('/' + normalizedPath + ext);
+      }
+  }
+
+  let bestMatchKey: string | null = null;
+  let bestMatchLen = Number.MAX_VALUE;
+
+  for (const fileKey of availableFiles.keys()) {
+      for (const suffix of searchSuffixes) {
+          if (fileKey.endsWith(suffix)) {
+              // Found a candidate.
+              // We prefer the shortest path (closest to what was requested / likely root)
+              // e.g. prefer "images/sword.png" over "images/unused/backup/sword.png"
+              if (fileKey.length < bestMatchLen) {
+                  bestMatchKey = fileKey;
+                  bestMatchLen = fileKey.length;
+              }
+          }
+      }
+  }
+
+  if (bestMatchKey) {
+      const data = availableFiles.get(bestMatchKey);
+      return { key: bestMatchKey, ...data };
   }
 
   return undefined;
